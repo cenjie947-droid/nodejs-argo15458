@@ -10,10 +10,9 @@ const path = require('path');
 const app = express();
 const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_URL?.includes('render.com') ? { rejectUnauthorized: false } : undefined, max: 5 });
 const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const COOKIE_SECRET = process.env.COOKIE_SECRET;
-if (!process.env.DATABASE_URL || !ADMIN_PASSWORD || !COOKIE_SECRET) {
-  console.error('Missing required env: DATABASE_URL, ADMIN_PASSWORD, COOKIE_SECRET'); process.exit(1);
+if (!process.env.DATABASE_URL || !COOKIE_SECRET) {
+  console.error('Missing required env: DATABASE_URL, COOKIE_SECRET'); process.exit(1);
 }
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: '7mb' }));
@@ -45,6 +44,25 @@ CREATE INDEX IF NOT EXISTS orders_status_idx ON orders(status);
 `;
 async function init(){ await pool.query(schema); console.log('Database schema ready'); }
 function sign(value){ return crypto.createHmac('sha256', COOKIE_SECRET).update(value).digest('hex'); }
+async function getAdminHash(){ const r=await pool.query("SELECT value FROM store_settings WHERE key='admin_password_hash'"); return r.rows[0]?.value || ''; }
+app.get('/api/admin/setup-status',async(req,res)=>{res.json({needsSetup:!(await getAdminHash())});});
+app.post('/api/admin/setup',rateLimit({windowMs:60*60*1000,limit:5,standardHeaders:true,legacyHeaders:false}),async(req,res)=>{
+ const password=String(req.body.password||'');
+ if(password.length<10||password.length>200)return res.status(400).json({error:'密码至少10位，最多200位'});
+ const client=await pool.connect();
+ try{
+  await client.query('BEGIN');
+  const r=await client.query("SELECT value FROM store_settings WHERE key='admin_password_hash' FOR UPDATE");
+  if(r.rows[0]?.value){await client.query('ROLLBACK');return res.status(409).json({error:'后台密码已经设置，请直接登录'});}
+  const salt=crypto.randomBytes(16).toString('hex');
+  const hash=crypto.scryptSync(password,salt,64).toString('hex');
+  await client.query("INSERT INTO store_settings(key,value) VALUES('admin_password_hash',$1)",[salt+':'+hash]);
+  await client.query('COMMIT');
+  const exp=String(Date.now()+12*60*60*1000);
+  res.cookie('shihai_admin',exp+'.'+sign(exp),{httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'strict',maxAge:12*60*60*1000});
+  res.json({ok:true});
+ }catch(e){await client.query('ROLLBACK');throw e;}finally{client.release();}
+});
 function admin(req,res,next){
  const token=req.cookies.shihai_admin;
  if(!token) return res.status(401).json({error:'请先登录后台'});
@@ -53,9 +71,14 @@ function admin(req,res,next){
  next();
 }
 const money = n => Number(n);
-app.post('/api/admin/login', rateLimit({windowMs:15*60*1000,limit:8,standardHeaders:true,legacyHeaders:false}), (req,res)=>{
+app.post('/api/admin/login', rateLimit({windowMs:15*60*1000,limit:8,standardHeaders:true,legacyHeaders:false}), async(req,res)=>{
  const password=String(req.body.password||'');
- if(password.length>200 || !crypto.timingSafeEqual(Buffer.from(crypto.createHash('sha256').update(password).digest('hex')),Buffer.from(crypto.createHash('sha256').update(ADMIN_PASSWORD).digest('hex')))) return res.status(401).json({error:'密码错误'});
+ const stored=await getAdminHash();
+ if(!stored)return res.status(409).json({error:'请先完成后台初始化'});
+ const [salt,hex]=stored.split(':');
+ const candidate=crypto.scryptSync(password,salt,64);
+ const expected=Buffer.from(hex,'hex');
+ if(password.length>200||candidate.length!==expected.length||!crypto.timingSafeEqual(candidate,expected))return res.status(401).json({error:'密码错误'});
  const exp=String(Date.now()+12*60*60*1000);
  res.cookie('shihai_admin',exp+'.'+sign(exp),{httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'strict',maxAge:12*60*60*1000});
  res.json({ok:true});
